@@ -246,7 +246,7 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/dist"
           find "$GITHUB_WORKSPACE/kernel/out" -path '*/dist/*' \
             \( -name 'boot_kpm.img' -o -name 'boot.img' -o -name 'Image' -o -name 'Image.lz4' \
-               -o -name 'Image.gz' -o -name 'vendor_dlkm.img' -o -name 'vendor_boot.img' -o -name 'dtbo.img' \) \
+               -o -name 'Image.gz' -o -name 'vendor_dlkm.img' -o -name 'system_dlkm.img' -o -name 'vendor_boot.img' -o -name 'dtbo.img' \) \
             -exec cp -v {} "$GITHUB_WORKSPACE/dist/" \; 2>/dev/null
           echo "=== built .config: KSU/KPM/RFKILL(应 =y) ==="
           find "$GITHUB_WORKSPACE/kernel/out" -name '.config' -exec grep -HE 'CONFIG_KSU=|CONFIG_KPM=|CONFIG_RFKILL=' {} \; 2>/dev/null | sort -u | head
