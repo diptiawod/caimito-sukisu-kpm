@@ -175,18 +175,17 @@ jobs:
           for f in $FILES; do sed -i 's/\bcheck_defconfig\b/true/g' "$f"; echo "patched $f"; done
 
       - name: Drop rfkill.ko from GKI module list (RFKILL 改内置后不再产出该 .ko)
-        working-directory: kernel
+        working-directory: kernel/aosp
         run: |
           set -e
-          # RFKILL=y 内置后 net/rfkill/rfkill.ko 不再生成，但 GKI system_dlkm 模块清单仍要求它，
-          # 打包阶段报 "Unable to find net/rfkill/rfkill.ko"。从清单删除该条目。
-          echo "=== 清单中的 rfkill.ko 条目 ==="
-          grep -rn 'rfkill\.ko' aosp/android private/devices 2>/dev/null | head -20 || true
-          FOUND=$(grep -rl 'rfkill\.ko' aosp/android private/devices 2>/dev/null || true)
-          echo "含 rfkill.ko 的清单文件: $FOUND"
-          for f in $FOUND; do sed -i '/rfkill\.ko/d' "$f"; echo "  已从 $f 移除 rfkill.ko 行"; done
-          echo "=== 复查(应为空)==="
-          grep -rn 'rfkill\.ko' aosp/android private/devices 2>/dev/null | head || echo "  清单中已无 rfkill.ko"
+          # RFKILL=y 内置后 net/rfkill/rfkill.ko 不再生成，但 kernel_aarch64 的 GKI 模块清单
+          # (aosp/modules.bzl，而非 android/gki_*_modules)仍列它 →
+          # 打包报 "Unable to find net/rfkill/rfkill.ko"。从 modules.bzl 删该行。
+          echo "=== 删除前 modules.bzl 中的 rfkill ==="
+          grep -n 'rfkill' modules.bzl || echo "  (无)"
+          sed -i '\#net/rfkill/rfkill\.ko#d' modules.bzl
+          echo "=== 删除后(应无 net/rfkill 行)==="
+          grep -n 'rfkill' modules.bzl || echo "  ✓ modules.bzl 已无 rfkill"
 
       - name: Build kernel (Kleaf build_caimito.sh, BUILD_AOSP_KERNEL=1)
         working-directory: kernel
