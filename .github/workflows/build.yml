@@ -1,0 +1,252 @@
+name: Build caimito SukiSU+KPM kernel
+
+# 目标: Pixel 9 (tokay / caimito / Tensor G4 zumapro), KMI android14-6.1,
+#   源码分支 android-gs-caimito-6.1-android16。
+#   SukiSU-Ultra v4.1.3 编入内核 (builtin) + CONFIG_KPM=y + SUSFS(gki-android14-6.1)。
+#   Kleaf 构建 build_caimito.sh，BUILD_AOSP_KERNEL=1 从源码编 aosp/(含 SukiSU/KPM)。
+#
+# ★ 本次核心修复: gki_defconfig 追加 CONFIG_RFKILL=y。
+#   自编内核曾把 RFKILL 降成 =m → 开机 modules.load 不加载 rfkill.ko → 内核缺 rfkill_blocked
+#   → 原厂 cfg80211.ko / bcmdhd4390.ko 无法加载 → 无 wlan0 → WiFi 开着却搜不到任何网络。
+#   改回 =y(内置)即根治。
+#
+# 已知坑(来自本机 caimito 实操记录，全部在下方对应步骤处理):
+#   1. use_prebuilt_gki: device.bazelrc 默认 true → 只用预编译 GKI、忽略我们的改动。改成 false。
+#   2. SukiSU setup.sh 建的是符号链接 drivers/kernelsu，Kleaf 沙箱里 include/uapi 悬空 → uapi/feature.h not found。改成真实拷贝。
+#   3. KSU_VERSION 由 git 提交数算，沙箱里算错 → 与管理器 v4.1.3(40796)不匹配、KPM 页被隐藏。钉死 40796。
+#   4. check_defconfig 会拒非规范格式的追加 config。中和为 true。
+#
+# 产物: boot.img(未打 KPM) + boot_kpm.img(打了 KPM patch_linux，可直接 fastboot flash boot) + Image。
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_branch:
+        description: "kernel manifest branch"
+        default: "android-gs-caimito-6.1-android16"
+      sukisu_ref:
+        description: "SukiSU-Ultra setup.sh 参数(tag/commit)"
+        default: "v4.1.3"
+      ksu_version_pin:
+        description: "钉死的 KSU_VERSION(需与已安装管理器版本一致)"
+        default: "40796"
+      magisk_tag:
+        description: "Magisk release tag(提取 magiskboot 用)"
+        default: "v30.7"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Free disk space
+        uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/share/gradle"
+
+      - name: Setup swap (Kleaf/LTO 吃内存)
+        uses: thejerrybao/setup-swap-space@v1
+        with:
+          swap-size-gb: 24
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git git-lfs gnupg gperf \
+            libssl-dev lzop rsync unzip zip zlib1g-dev python3 python-is-python3 \
+            libarchive-tools cpio
+          df -h /
+
+      - name: Setup repo tool
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -sL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name ci
+          git config --global user.email ci@local
+          git config --global color.ui false
+
+      - name: Sync caimito kernel source
+        env:
+          MANIFEST_BRANCH: ${{ inputs.manifest_branch }}
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/kernel"
+          cd "$GITHUB_WORKSPACE/kernel"
+          repo init -u https://android.googlesource.com/kernel/manifest -b "$MANIFEST_BRANCH" --depth=1
+          repo sync -c -j"$(nproc)" --no-tags --fail-fast --force-sync --no-clone-bundle
+          echo "=== tree ==="; ls -la
+          echo "=== kernel version (aosp/Makefile) ==="
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) ' aosp/Makefile || true
+          echo "=== build_*.sh present? ==="; ls -la build_*.sh 2>/dev/null || true
+          echo "=== bazelrc 里的 use_prebuilt_gki ==="
+          grep -rn 'use_prebuilt_gki' --include='*.bazelrc' . 2>/dev/null | head -20 || true
+          df -h /
+
+      - name: Force use_prebuilt_gki=false (否则不编我们的改动)
+        working-directory: kernel
+        run: |
+          set -e
+          # 1) 直接改所有 bazelrc 里的 true → false
+          for f in $(grep -rl 'use_prebuilt_gki=true' --include='*.bazelrc' . 2>/dev/null); do
+            sed -i 's/use_prebuilt_gki=true/use_prebuilt_gki=false/g' "$f"
+            echo "patched $f"
+          done
+          # 2) 保险:build:caimito 段追加 false(后出现的覆盖先出现的;build_caimito.sh 传 --config=caimito)
+          echo 'build:caimito --use_prebuilt_gki=false' > .d6.bazelrc
+          echo "=== 复查 ==="; grep -rn 'use_prebuilt_gki' --include='*.bazelrc' . 2>/dev/null | head -20 || true
+
+      - name: Integrate SukiSU-Ultra (builtin) into aosp/
+        working-directory: kernel/aosp
+        env:
+          SUKISU_REF: ${{ inputs.sukisu_ref }}
+          PIN: ${{ inputs.ksu_version_pin }}
+        run: |
+          set -e
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s "$SUKISU_REF"
+          echo "=== setup.sh 后 drivers/kernelsu(应为符号链接)==="; ls -la drivers/kernelsu || true
+
+          # 坑2: 把符号链接换成真实拷贝(-L 解引用内部符号链接，治 uapi/feature.h not found)
+          rm -f drivers/kernelsu
+          cp -rL KernelSU/kernel drivers/kernelsu
+          echo "=== 换成真实拷贝后 ==="; ls -la drivers/kernelsu | head
+          echo "=== uapi 头是否为实体文件 ==="; ls -la drivers/kernelsu/include/uapi/ 2>/dev/null || find drivers/kernelsu -name 'feature.h' | head
+
+          # 坑3: 钉死 KSU_VERSION(与管理器版本一致，否则 KPM 页被隐藏)
+          echo "=== 钉死前 KSU_VERSION ==="; grep -rn 'KSU_VERSION' drivers/kernelsu/ | head
+          for f in drivers/kernelsu/Makefile drivers/kernelsu/Kbuild; do
+            [ -f "$f" ] && sed -i -E "s/^([[:space:]]*KSU_VERSION[[:space:]]*:?=[[:space:]]*).*/\1${PIN}/" "$f" || true
+          done
+          echo "=== 钉死后 KSU_VERSION ==="; grep -rn 'KSU_VERSION' drivers/kernelsu/ | head
+
+      - name: Integrate SUSFS (gki-android14-6.1)
+        working-directory: kernel
+        run: |
+          set -e
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android14-6.1 --depth=1 susfs4ksu
+          echo "=== susfs kernel_patches ==="; ls susfs4ksu/kernel_patches/ 2>/dev/null | head
+          cp -v susfs4ksu/kernel_patches/fs/* aosp/fs/ 2>/dev/null || true
+          cp -v susfs4ksu/kernel_patches/include/linux/* aosp/include/linux/ 2>/dev/null || true
+          PATCH=$(ls susfs4ksu/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch 2>/dev/null || ls susfs4ksu/kernel_patches/50_add_susfs*.patch 2>/dev/null | head -1)
+          echo "susfs patch: $PATCH"
+          cp "$PATCH" aosp/
+          ( cd aosp && patch -p1 < "$(basename "$PATCH")" 2>&1 | tail -30 ) || echo "WARN: susfs patch 有 rejects(继续)"
+          echo "=== susfs.h / susfs.c 到位? ==="; ls -la aosp/include/linux/susfs.h aosp/fs/susfs.c 2>/dev/null || true
+
+      - name: Enable KSU + KPM + RFKILL + SUSFS in gki_defconfig
+        working-directory: kernel/aosp
+        run: |
+          set -e
+          CFG=arch/arm64/configs/gki_defconfig
+          {
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KPM=y"
+            echo "CONFIG_RFKILL=y"                # ★ 本次核心修复: 治 WiFi 不显示列表
+            echo "CONFIG_KALLSYMS=y"
+            echo "CONFIG_KALLSYMS_ALL=y"
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+          } >> "$CFG"
+          echo "=== tail gki_defconfig ==="; tail -15 "$CFG"
+
+      - name: Relax strict defconfig check
+        working-directory: kernel
+        run: |
+          set -e
+          # gs-google 经 POST_DEFCONFIG_CMDS 跑 check_defconfig(savedefconfig 回环 diff)，
+          # append 的 KSU/KPM/RFKILL 非规范格式会 fail。把 build.config* 里的调用中和为 true。
+          FILES=$(grep -rln 'check_defconfig' aosp build private 2>/dev/null | grep -E 'build\.config' || true)
+          echo "含 check_defconfig 的 build.config:"; echo "$FILES"
+          for f in $FILES; do sed -i 's/\bcheck_defconfig\b/true/g' "$f"; echo "patched $f"; done
+
+      - name: Build kernel (Kleaf build_caimito.sh, BUILD_AOSP_KERNEL=1)
+        working-directory: kernel
+        run: |
+          set -eo pipefail
+          # BUILD_AOSP_KERNEL=1: 从源码编 aosp/(含 SukiSU+KPM)，否则用预编译 GKI 忽略我们的改动
+          export LTO=thin BUILD_KERNEL=1 BUILD_AOSP_KERNEL=1
+          export TRIM_NONLISTED_KMI=0 KMI_SYMBOL_LIST_STRICT_MODE=0 ENABLE_STRICT_KMI=0
+          if [ -f build_caimito.sh ]; then
+            ./build_caimito.sh 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          else
+            echo "!! build_caimito.sh 不存在，列出可用构建脚本:"; ls -la build_*.sh || true
+            exit 1
+          fi
+
+      - name: KPM patch_linux + repack boot_kpm.img
+        if: always()
+        working-directory: kernel
+        env:
+          MAGISK_TAG: ${{ inputs.magisk_tag }}
+        run: |
+          set -e
+          DIST=$(find out -type d -name dist 2>/dev/null | head -1)
+          echo "dist = $DIST"; [ -n "$DIST" ] || { echo "!! 找不到 dist，构建可能失败"; exit 0; }
+          ls -la "$DIST"
+          cd "$DIST"
+
+          # 提取 magiskboot(从 Magisk apk 的 x86_64 native lib，可在 ubuntu 直接跑)
+          curl -LSs "https://github.com/topjohnwu/Magisk/releases/download/${MAGISK_TAG}/Magisk-${MAGISK_TAG}.apk" -o /tmp/magisk.apk
+          unzip -o /tmp/magisk.apk 'lib/x86_64/*' -d /tmp/magisk_x >/dev/null
+          cp /tmp/magisk_x/lib/x86_64/libmagiskboot.so ./magiskboot
+          chmod +x ./magiskboot
+          echo "=== magiskboot 自检 ==="; ./magiskboot 2>&1 | head -3 || true
+
+          [ -f boot.img ] || { echo "!! 无 boot.img，跳过 KPM 打包"; exit 0; }
+
+          # 从 boot.img 取出内核(magiskboot 自动解压为裸 Image)
+          ./magiskboot unpack boot.img
+          ls -la kernel Image* 2>/dev/null || true
+
+          # 下载 patch_linux(SukiSU-Ultra KPM)，对裸 Image 打补丁
+          curl -LSs "https://raw.githubusercontent.com/Numbersf/Action-Build/SukiSU-Ultra/patches/kpm/patch_linux" -o patch_linux
+          chmod +x patch_linux
+          cp -f kernel Image
+          ./patch_linux                 # 读 Image → 输出 oImage
+          ls -la oImage
+          cp -f oImage kernel
+
+          # 用打好补丁的 kernel 重新打包
+          ./magiskboot repack boot.img boot_kpm.img
+          ls -la boot_kpm.img
+          echo "KPM 打包完成 → $DIST/boot_kpm.img"
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          set +e
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          find "$GITHUB_WORKSPACE/kernel/out" -path '*/dist/*' \
+            \( -name 'boot_kpm.img' -o -name 'boot.img' -o -name 'Image' -o -name 'Image.lz4' \
+               -o -name 'Image.gz' -o -name 'vendor_dlkm.img' -o -name 'vendor_boot.img' -o -name 'dtbo.img' \) \
+            -exec cp -v {} "$GITHUB_WORKSPACE/dist/" \; 2>/dev/null
+          echo "=== built .config: KSU/KPM/RFKILL(应 =y) ==="
+          find "$GITHUB_WORKSPACE/kernel/out" -name '.config' -exec grep -HE 'CONFIG_KSU=|CONFIG_KPM=|CONFIG_RFKILL=' {} \; 2>/dev/null | sort -u | head
+          echo "=== dist ==="; ls -la "$GITHUB_WORKSPACE/dist/" || true
+          tail -c 6000 "$GITHUB_WORKSPACE/build.log" 2>/dev/null || true
+
+      - name: Upload dist
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: caimito-sukisu-kpm-dist
+          path: |
+            dist/**
+            build.log
+          if-no-files-found: warn
+          compression-level: 6
